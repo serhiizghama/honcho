@@ -211,9 +211,8 @@ class OpenAIBackend:
                 response = await self._client.chat.completions.parse(**params)
             except LengthFinishReasonError as exc:
                 # Truncated output: repair the partial content directly. repair
-                # handles empty/unrepairable JSON with its own model-aware fallback
-                # (PromptRepresentation -> empty, others -> raise), which differs
-                # from the parse-fallback terminal below, so it stays a direct call.
+                # salvages recoverable JSON and raises on unrepairable/schema-
+                # ignored content so the retry/fallback chain engages (#993).
                 truncated = exc.completion
                 raw_content = truncated.choices[0].message.content or ""
                 content = repair_response_model_json(
@@ -548,8 +547,8 @@ class OpenAIBackend:
         raw_content = message.content or ""
         if raw_content:
             # Fast path: clean JSON validates directly. Only fall back to the
-            # repair pipeline when validation fails — repair is comparatively
-            # expensive and silently degrades malformed input to an empty model.
+            # repair pipeline when validation fails — repair salvages recoverable
+            # JSON and raises on unrepairable/schema-ignored input (#993).
             try:
                 return validate_structured_output(raw_content, response_format)
             except (StructuredOutputError, ValidationError):
