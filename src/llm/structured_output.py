@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 import json
+import logging
+from typing import Any, cast
 
 from pydantic import BaseModel, ValidationError
 
 from src.utils.json_parser import validate_and_repair_json
 from src.utils.representation import PromptRepresentation
+
+logger = logging.getLogger(__name__)
 
 
 class StructuredOutputError(ValueError):
@@ -33,8 +37,18 @@ def repair_response_model_json(
     response_model: type[BaseModel],
     _model: str,
 ) -> BaseModel:
-    """Repair truncated or malformed JSON and validate against the response model."""
+    """Repair truncated or malformed JSON and validate against the response model.
 
+    A ``PromptRepresentation`` used to fall back to an empty result whenever
+    repair or validation failed. Because ``explicit`` has a ``default_factory``,
+    that swallowed two distinct failures as if the model had legitimately found
+    nothing: unparseable JSON, and well-formed JSON that ignores the schema
+    entirely (e.g. ``{"wrong": 1}``). Both propagate as errors now so the
+    caller's retry/fallback chain engages; a genuine ``{"explicit": []}`` still
+    validates as an honest empty extraction.
+    """
+
+    repaired_data: Any = None
     try:
         final = validate_and_repair_json(raw_content)
         repaired_data = json.loads(final)
@@ -62,11 +76,30 @@ def repair_response_model_json(
     except (json.JSONDecodeError, KeyError, TypeError, ValueError):
         final = ""
 
+    # Well-formed JSON that shares no recognized key with the schema ignored it
+    # entirely and would otherwise validate to an empty PromptRepresentation.
+    if response_model is PromptRepresentation and isinstance(repaired_data, dict):
+        payload_keys = set(cast("dict[str, Any]", repaired_data))
+        recognized = set(response_model.model_fields) | {"deductive"}
+        if not recognized & payload_keys:
+            logger.error(
+                "Structured output ignored the schema (keys=%s); raw=%r",
+                sorted(payload_keys),
+                raw_content[:500],
+            )
+            raise StructuredOutputError(
+                "Structured output did not match the expected schema"
+            )
+
     try:
         return response_model.model_validate_json(final)
     except ValidationError:
         if response_model is PromptRepresentation:
-            return PromptRepresentation(explicit=[])
+            logger.error(
+                "Failed to repair structured output into %s; raw=%r",
+                response_model.__name__,
+                raw_content[:500],
+            )
         raise
 
 
