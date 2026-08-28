@@ -1,7 +1,7 @@
 import asyncio
 import logging
 import weakref
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, replace
 from datetime import datetime
 from typing import Any, cast
@@ -1467,11 +1467,10 @@ def _normalize_observation_id(obs_id: str) -> str:
     return obs_id.strip()
 
 
-async def _latest_source_timestamp(
-    ctx: ToolContext,
-    observations: list[schemas.ObservationInput],
+def _latest_source_timestamp(
+    source_docs: Iterable[models.Document],
 ) -> str | None:
-    """Latest ``message_created_at`` across all source observations in the batch.
+    """Latest ``message_created_at`` across the resolved source documents.
 
     Dreamer conclusions (deductive/inductive) are derived from existing
     observations referenced by ``source_ids`` rather than from live messages.
@@ -1479,36 +1478,22 @@ async def _latest_source_timestamp(
     from its evidence, not when the dreamer happened to run, so we date
     ``internal_metadata["message_created_at"]`` to the most recent source
     observation. The physical ``Document.created_at`` column remains the insert
-    time. Returns None if no source_ids resolve to a usable timestamp (caller
-    falls back to now).
+    time. Callers pass the documents already resolved during provenance
+    validation. Returns None if none carry a usable timestamp (caller falls
+    back to now).
     """
-    source_ids: list[str] = []
-    for obs in observations:
-        if obs.source_ids:
-            source_ids.extend(obs.source_ids)
-    if not source_ids:
-        return None
-
     latest: datetime | None = None
-    async with tracked_db("create_observations.source_ts", read_only=True) as db:
-        docs = await crud.fetch_documents_by_ids(
-            db,
-            workspace_name=ctx.workspace_name,
-            observer=ctx.observer,
-            observed=ctx.observed,
-            document_ids=list(set(source_ids)),
-        )
-        for doc in docs:
-            raw = doc.internal_metadata.get("message_created_at")
-            if not isinstance(raw, str):
-                continue
-            try:
-                # always tz-aware, so the comparison below can't crash on mixed formats
-                parsed = parse_datetime_iso(raw)
-            except ValueError:
-                continue
-            if latest is None or parsed > latest:
-                latest = parsed
+    for doc in source_docs:
+        raw = doc.internal_metadata.get("message_created_at")
+        if not isinstance(raw, str):
+            continue
+        try:
+            # always tz-aware, so the comparison below can't crash on mixed formats
+            parsed = parse_datetime_iso(raw)
+        except ValueError:
+            continue
+        if latest is None or parsed > latest:
+            latest = parsed
 
     return format_datetime_utc(latest) if latest is not None else None
 
@@ -1587,6 +1572,59 @@ async def _handle_create_observations_impl(
         )
         return f"ERROR: All observations failed validation: {failure_details}"
 
+    # Resolve cited source_ids against real documents before persistence.
+    # Dreamer specialists sometimes fabricate ids (or paste a message line into
+    # the field); nothing downstream re-checks them, so a dangling citation
+    # becomes permanent false provenance — it breaks reasoning-tree traversal
+    # and, on 3.0.12+, silently mis-dates the conclusion when no source
+    # resolves. Strip ids that don't resolve, and reject any observation left
+    # without the real sources its level requires. See issue #939.
+    source_docs_by_id: dict[str, models.Document] = {}
+    cited_ids = {
+        sid for obs in observations if obs.source_ids for sid in obs.source_ids
+    }
+    if cited_ids:
+        async with tracked_db(
+            "create_observations.validate_sources", read_only=True
+        ) as db:
+            resolved = await crud.fetch_documents_by_ids(
+                db,
+                workspace_name=ctx.workspace_name,
+                observer=ctx.observer,
+                observed=ctx.observed,
+                document_ids=list(cited_ids),
+            )
+        source_docs_by_id = {doc.id: doc for doc in resolved}
+
+        kept: list[schemas.ObservationInput] = []
+        for obs in observations:
+            if not obs.source_ids:
+                kept.append(obs)
+                continue
+            valid_ids = [sid for sid in obs.source_ids if sid in source_docs_by_id]
+            min_required = 2 if obs.level == "contradiction" else 1
+            if len(valid_ids) < min_required:
+                validation_failures.append(
+                    ObservationFailure(
+                        content_preview=obs.content[:50],
+                        error=(
+                            f"{obs.level} observation cites no resolvable source "
+                            "documents; source_ids do not exist"
+                        ),
+                    )
+                )
+                continue
+            if valid_ids != obs.source_ids:
+                obs = obs.model_copy(update={"source_ids": valid_ids})
+            kept.append(obs)
+        observations = kept
+
+        if not observations:
+            failure_details = "; ".join(
+                f"'{f.content_preview}': {f.error}" for f in validation_failures
+            )
+            return f"ERROR: All observations failed validation: {failure_details}"
+
     # Determine message context
     if ctx.current_messages:
         message_ids = [msg.id for msg in ctx.current_messages]
@@ -1595,10 +1633,9 @@ async def _handle_create_observations_impl(
     else:
         # Dreamer path: no current messages. Backdate the conclusion to the
         # latest source observation, which is when the inference became possible.
-
         message_ids = []
         message_created_at = (
-            await _latest_source_timestamp(ctx, observations)
+            _latest_source_timestamp(source_docs_by_id.values())
         ) or utc_now_iso()
 
     # Use lock to serialize database writes (prevents concurrent commit issues)
