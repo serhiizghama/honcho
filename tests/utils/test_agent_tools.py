@@ -218,10 +218,13 @@ class TestCreateObservations:
     async def test_dialectic_context_forces_deductive(
         self,
         db_session: AsyncSession,
+        tool_test_data: Any,
         make_tool_context: Callable[..., ToolContext],
     ):
         """Dialectic context (no current_messages) forces observations to be deductive."""
+        _workspace, _peer1, _peer2, _session, _messages, documents = tool_test_data
         ctx = make_tool_context(current_messages=None)
+        premise_ids = [documents[0].id, documents[1].id]
 
         result = await _handle_create_observations(
             ctx,
@@ -229,7 +232,7 @@ class TestCreateObservations:
                 "observations": [
                     {
                         "content": "Inferred preference for quiet spaces",
-                        "source_ids": ["premise1", "premise2"],
+                        "source_ids": premise_ids,
                         "premises": [
                             "User mentioned working in libraries",
                             "User avoids noisy cafes",
@@ -249,7 +252,7 @@ class TestCreateObservations:
         doc = (await db_session.execute(stmt)).scalar_one_or_none()
         assert doc is not None
         assert doc.level == "deductive"
-        assert doc.source_ids == ["premise1", "premise2"]
+        assert doc.source_ids == premise_ids
 
     async def test_non_deriver_context_rejects_explicit(
         self,
@@ -284,10 +287,12 @@ class TestCreateObservations:
     async def test_source_ids_display_prefix_is_stripped(
         self,
         db_session: AsyncSession,
+        tool_test_data: Any,
         make_tool_context: Callable[..., ToolContext],
     ):
         """Models sometimes copy the '[id:xxx]' display format into source_ids;
         the prefix must be stripped so provenance links reference real IDs."""
+        _workspace, _peer1, _peer2, _session, _messages, documents = tool_test_data
         ctx = make_tool_context(current_messages=None)
 
         result = await _handle_create_observations(
@@ -296,7 +301,10 @@ class TestCreateObservations:
                 "observations": [
                     {
                         "content": "Inferred preference for early mornings",
-                        "source_ids": ["id:premise1", "ID:premise2"],
+                        "source_ids": [
+                            f"id:{documents[0].id}",
+                            f"ID:{documents[1].id}",
+                        ],
                         "premises": [
                             "User schedules meetings before 9am",
                             "User mentions waking at 5:30",
@@ -313,7 +321,56 @@ class TestCreateObservations:
         )
         doc = (await db_session.execute(stmt)).scalar_one_or_none()
         assert doc is not None
-        assert doc.source_ids == ["premise1", "premise2"]
+        assert doc.source_ids == [documents[0].id, documents[1].id]
+
+    async def test_fabricated_source_ids_stripped_and_reject_when_none_resolve(
+        self,
+        db_session: AsyncSession,
+        tool_test_data: Any,
+        make_tool_context: Callable[..., ToolContext],
+    ):
+        """source_ids that don't resolve to real documents are dropped, and an
+        observation left without any real source is rejected rather than
+        persisted with false provenance (issue #939)."""
+        _workspace, _peer1, _peer2, _session, _messages, documents = tool_test_data
+        ctx = make_tool_context(current_messages=None)
+
+        result = await _handle_create_observations(
+            ctx,
+            {
+                "observations": [
+                    {
+                        # one real premise + one fabricated id
+                        "content": "Mixed provenance conclusion",
+                        "source_ids": [documents[0].id, "does-not-exist"],
+                        "premises": ["real premise", "hallucinated premise"],
+                    },
+                    {
+                        # only fabricated ids -> no real provenance
+                        "content": "Fully fabricated conclusion",
+                        "source_ids": ["ghost-1", "ghost-2"],
+                        "premises": ["ghost a", "ghost b"],
+                    },
+                ]
+            },
+        )
+
+        assert "Created 1 observations" in result
+
+        # The mixed one persists with the fabricated id stripped out.
+        stmt = select(models.Document).where(
+            models.Document.content == "Mixed provenance conclusion"
+        )
+        kept = (await db_session.execute(stmt)).scalar_one_or_none()
+        assert kept is not None
+        assert kept.source_ids == [documents[0].id]
+
+        # The fully fabricated one is rejected, not written.
+        stmt = select(models.Document).where(
+            models.Document.content == "Fully fabricated conclusion"
+        )
+        dropped = (await db_session.execute(stmt)).scalar_one_or_none()
+        assert dropped is None
 
     async def test_empty_observations_list_returns_error(
         self, make_tool_context: Callable[..., ToolContext]
